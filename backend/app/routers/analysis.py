@@ -1,4 +1,3 @@
-import random
 import time
 from datetime import datetime, timezone
 
@@ -6,94 +5,70 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, get_db
+from app.eo.change import run_change_detection
 from app.models import AnalysisJob, AreaOfInterest, ChangeDetectionResult, Scene
 from app.schemas import JobCreate, JobOut
 
 router = APIRouter(prefix="/jobs", tags=["Analysis Jobs"])
 
-# ── Change detection simulation ───────────────────────────────────────────────
 
-_CHANGE_SUMMARIES = {
-    "low": [
-        "Minor seasonal variation detected. Vegetation indices show normal fluctuation consistent with the time of year.",
-        "Slight reflectance differences observed. No significant land-cover transition detected in this period.",
-        "Low-magnitude spectral change consistent with agricultural rotation or phenological cycle.",
-    ],
-    "medium": [
-        "Moderate vegetation loss detected across {pct:.1f}% of the AOI. Likely logging or agricultural clearing activity.",
-        "Significant water body extent change observed. Possible drought impact or reservoir drawdown.",
-        "Urban footprint expansion detected at {pct:.1f}% of monitored area. Infrastructure development in progress.",
-        "Mixed land-cover transition observed. Combination of vegetation clearing and bare soil exposure.",
-    ],
-    "high": [
-        "Substantial deforestation event detected — {pct:.1f}% canopy loss. Immediate ground-truth verification recommended.",
-        "Large-scale fire scar detected across {pct:.1f}% of AOI. Post-fire vegetation recovery monitoring advised.",
-        "Major flood inundation event. Water extent expanded significantly beyond baseline.",
-        "Rapid urban expansion event with {pct:.1f}% land conversion from vegetation/bare soil.",
-    ],
-    "critical": [
-        "Critical deforestation alert: {pct:.1f}% primary forest loss detected. Consistent with industrial-scale clearing.",
-        "Catastrophic wildfire event — {pct:.1f}% area affected. Immediate response and long-term monitoring required.",
-        "Severe land degradation event. Multiple change type indicators at maximum levels.",
-    ],
-}
+# ── Background change-detection task ─────────────────────────────────────────
 
+def _run_change_detection(job_id: int) -> None:
+    """
+    Background thread: loads both scene GeoTIFFs, computes real NDVI change
+    metrics, writes a ChangeDetectionResult, and marks the job completed/failed.
 
-def _simulate_change_detection(job_id: int) -> None:
-    """Runs in a background thread; uses its own DB session."""
-    time.sleep(random.uniform(2.0, 5.0))  # simulate processing latency
-
+    Requires both scenes to have a non-null file_path pointing to a valid
+    GeoTIFF.  If either is missing the job is failed immediately with a clear
+    error_message that the UI can display.
+    """
     db: Session = SessionLocal()
     try:
         job = db.get(AnalysisJob, job_id)
         if job is None or job.status != "running":
             return
 
-        # Generate realistic-looking random change metrics
-        rng = random.Random(job_id * 31337)
+        scene_before: Scene | None = db.get(Scene, job.scene_before_id)
+        scene_after: Scene | None = db.get(Scene, job.scene_after_id)
 
-        change_pct = rng.uniform(1.0, 45.0)
-        veg_loss = rng.uniform(0, change_pct * 0.6)
-        veg_gain = rng.uniform(0, change_pct * 0.2)
-        water = rng.uniform(0, change_pct * 0.15)
-        urban = rng.uniform(0, change_pct * 0.2)
-        bare = max(0.0, change_pct - veg_loss - veg_gain - water - urban)
+        # Validate files are present
+        missing = []
+        if not scene_before or not scene_before.file_path:
+            missing.append("before")
+        if not scene_after or not scene_after.file_path:
+            missing.append("after")
+        if missing:
+            job.status = "failed"
+            job.error_message = (
+                f"Scene(s) missing GeoTIFF file: {', '.join(missing)}. "
+                "Upload a GeoTIFF via the Scenes page before running analysis."
+            )
+            db.commit()
+            return
 
-        ndvi_before = rng.uniform(0.3, 0.75)
-        ndvi_after = ndvi_before + rng.uniform(-0.35, 0.1)
-        ndvi_after = max(-1.0, min(1.0, ndvi_after))
-        ndvi_delta = ndvi_after - ndvi_before
-
-        if change_pct < 5:
-            severity = "low"
-        elif change_pct < 15:
-            severity = "medium"
-        elif change_pct < 30:
-            severity = "high"
-        else:
-            severity = "critical"
-
-        template = rng.choice(_CHANGE_SUMMARIES[severity])
-        summary = template.format(pct=change_pct)
+        # Run real NDVI change detection (may take a few seconds on large files)
+        metrics = run_change_detection(scene_before.file_path, scene_after.file_path)
 
         result = ChangeDetectionResult(
             job_id=job_id,
-            change_pct=round(change_pct, 2),
-            vegetation_loss_pct=round(veg_loss, 2),
-            vegetation_gain_pct=round(veg_gain, 2),
-            water_change_pct=round(water, 2),
-            urban_expansion_pct=round(urban, 2),
-            bare_soil_pct=round(bare, 2),
-            ndvi_before=round(ndvi_before, 4),
-            ndvi_after=round(ndvi_after, 4),
-            ndvi_delta=round(ndvi_delta, 4),
-            summary=summary,
-            severity=severity,
+            change_pct=metrics["change_pct"],
+            vegetation_loss_pct=metrics["vegetation_loss_pct"],
+            vegetation_gain_pct=metrics["vegetation_gain_pct"],
+            water_change_pct=metrics["water_change_pct"],
+            urban_expansion_pct=metrics["urban_expansion_pct"],
+            bare_soil_pct=metrics["bare_soil_pct"],
+            ndvi_before=metrics["ndvi_before"],
+            ndvi_after=metrics["ndvi_after"],
+            ndvi_delta=metrics["ndvi_delta"],
+            summary=metrics["summary"],
+            severity=metrics["severity"],
         )
         db.add(result)
         job.status = "completed"
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
+
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         job = db.get(AnalysisJob, job_id)
@@ -116,18 +91,40 @@ def list_jobs(aoi_id: int | None = None, db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=JobOut, status_code=201)
-def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def create_job(
+    payload: JobCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     aoi = db.get(AreaOfInterest, payload.aoi_id)
     if not aoi:
         raise HTTPException(status_code=404, detail="AOI not found")
-    for scene_id, label in [(payload.scene_before_id, "before"), (payload.scene_after_id, "after")]:
+
+    for scene_id, label in [
+        (payload.scene_before_id, "before"),
+        (payload.scene_after_id, "after"),
+    ]:
         scene = db.get(Scene, scene_id)
         if not scene:
             raise HTTPException(status_code=404, detail=f"Scene ({label}) not found")
         if scene.aoi_id != payload.aoi_id:
-            raise HTTPException(status_code=400, detail=f"Scene ({label}) does not belong to this AOI")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Scene ({label}) does not belong to this AOI",
+            )
+        if not scene.file_path:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Scene ({label}) has no uploaded GeoTIFF. "
+                    "Upload a file via the Scenes page before running analysis."
+                ),
+            )
+
     if payload.scene_before_id == payload.scene_after_id:
-        raise HTTPException(status_code=400, detail="Before and after scenes must be different")
+        raise HTTPException(
+            status_code=400, detail="Before and after scenes must be different"
+        )
 
     job = AnalysisJob(
         aoi_id=payload.aoi_id,
@@ -139,7 +136,7 @@ def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Sessio
     db.commit()
     db.refresh(job)
 
-    background_tasks.add_task(_simulate_change_detection, job.id)
+    background_tasks.add_task(_run_change_detection, job.id)
     return job
 
 
